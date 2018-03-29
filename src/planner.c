@@ -1,13 +1,19 @@
 #include <postgres.h>
 #include <nodes/plannodes.h>
+#include <nodes/relation.h>
 #include <parser/parsetree.h>
 #include <optimizer/clauses.h>
 #include <optimizer/planner.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
+#include <optimizer/tlist.h>
 #include <catalog/namespace.h>
 #include <utils/guc.h>
 #include <miscadmin.h>
+#include <executor/nodeAgg.h>
+#include <utils/timestamp.h>
+#include <utils/lsyscache.h>
+#include <utils/selfuncs.h>
 
 #include "compat-msvc-enter.h"
 #include <optimizer/cost.h>
@@ -22,12 +28,14 @@
 #include "planner_utils.h"
 #include "hypertable_insert.h"
 #include "constraint_aware_append.h"
+#include "plan_add_hashagg.h"
 
 void		_planner_init(void);
 void		_planner_fini(void);
 
 static planner_hook_type prev_planner_hook;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook;
+static create_upper_paths_hook_type prev_create_upper_paths_hook;
 
 typedef struct ModifyTableWalkerCtx
 {
@@ -323,6 +331,83 @@ out_release:
 	cache_release(hcache);
 }
 
+static bool involves_hypertable_relid(PlannerInfo *root, Index relid)
+{
+	RangeTblEntry *rte;
+	Cache	   *hcache;
+	Hypertable *ht;
+	bool result;
+
+	if(relid == 0)
+		return false;
+
+	rte = planner_rt_fetch(relid, root);
+
+	hcache = hypertable_cache_pin();
+	ht = hypertable_cache_get_entry(hcache, rte->relid);
+
+	result = (ht != NULL);
+
+	cache_release(hcache);
+	return result;
+}
+
+static bool involves_hypertable_relid_set(PlannerInfo *root, Relids relid_set)
+{
+	int relid = -1;
+	while ((relid = bms_next_member(relid_set, relid)) >= 0)
+	{
+		if(involves_hypertable_relid(root, relid))
+			return true;
+	}
+	return false;
+}
+
+static bool involves_hypertable(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+	switch(rel->reloptkind)
+	{
+		case RELOPT_BASEREL:
+		case RELOPT_OTHER_MEMBER_REL:
+			/* Optimization for a quick exit */
+			rte = planner_rt_fetch(rel->relid, root);
+			if (!(is_append_parent(rel, rte) || is_append_child(rel, rte)))
+				return false;
+
+			return involves_hypertable_relid(root, rel->relid);
+		case RELOPT_JOINREL:
+			return involves_hypertable_relid_set(root,
+			                                  rel->relids);
+		default:
+			return false;
+	}
+}
+
+static
+void
+timescale_create_upper_paths_hook(PlannerInfo *root,
+								  UpperRelationKind stage,
+								  RelOptInfo *input_rel,
+								  RelOptInfo *output_rel)
+{
+	if (prev_create_upper_paths_hook != NULL)
+		prev_create_upper_paths_hook(root, stage, input_rel, output_rel);
+
+	if (!extension_is_loaded() ||
+		guc_disable_optimizations ||
+		input_rel == NULL ||
+		IS_DUMMY_REL(input_rel))
+		return;
+
+	if(!guc_optimize_non_hypertables && !involves_hypertable(root, input_rel))
+		return;
+
+	if (UPPERREL_GROUP_AGG == stage)
+		plan_add_hashagg(root, input_rel, output_rel);
+}
+
+
 void
 _planner_init(void)
 {
@@ -330,6 +415,8 @@ _planner_init(void)
 	planner_hook = timescaledb_planner;
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = timescaledb_set_rel_pathlist;
+	prev_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = timescale_create_upper_paths_hook;
 }
 
 void
@@ -337,4 +424,5 @@ _planner_fini(void)
 {
 	planner_hook = prev_planner_hook;
 	set_rel_pathlist_hook = prev_set_rel_pathlist_hook;
+	create_upper_paths_hook = prev_create_upper_paths_hook;
 }
